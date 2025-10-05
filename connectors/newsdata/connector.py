@@ -93,7 +93,7 @@ def update(configuration: dict, state: dict):
                             f.write(json.dumps(fif_record) + '\n')
                             
                 except rq.exceptions.RequestException as e:
-                    log.error(f"API request failed for keyword '{keyword}': {e}. Continuing.")
+                    log.severe(f"API request failed for keyword '{keyword}': {e}. Continuing.")
                 
             log.info(f"Total unique articles processed and written to {OUTPUT_DATA_PATH}.")
 
@@ -116,7 +116,7 @@ if __name__ == "__main__":
         with open("configuration.json", "r") as f:
             configuration = json.load(f)
     except FileNotFoundError:
-        log.error("configuration.json not found. Using empty configuration.")
+        log.severe("configuration.json not found. Using empty configuration.")
         configuration = {}
         
     # We must call debug() to execute the logic, even though it won't be used to read the FIF file.
