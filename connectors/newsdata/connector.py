@@ -1,90 +1,208 @@
 from fivetran_connector_sdk import Connector
-
-# For enabling Logs in your connector code
-from fivetran_connector_sdk import Logging as log
-
-# For supporting Data operations like Upsert(), Update(), Delete() and checkpoint()
 from fivetran_connector_sdk import Operations as op
+from fivetran_connector_sdk import Logging as log
+# Necessary import for real News API calls
+from newsapi import NewsApiClient 
+import json
+from datetime import datetime, timedelta # ADDED for incremental sync logic
 
-# Import requests to make HTTP calls to API.
-import requests
+# --- Constants ---
+TABLE_NAME = "NEWS_ARTICLES"
+MAX_ARTICLES_PER_REQUEST = 100  # Max page size for News API
+MAX_PAGES_TO_FETCH = 5          # Limit total pages to fetch for the combined query
 
-# Import dataclass for creating POJO-style classes
-from dataclasses import dataclass
+# ----------------------------------------------------
+# 1. Schema Definition
+# ----------------------------------------------------
 
-# Import time for implementing exponential backoff
-import time
-
-
-API_URL = "https://newsdata.io/api/1/archive?apikey="
-API_KEY = "pub_7f9c85763ec94ffca92758b23bc630f3"
-__MAX_RETRIES = 3  # Maximum number of retries for failed requests
-__BASE_DELAY = 2  # Base delay for exponential backoff in seconds
-
-# POJO-style response class
-@dataclass
-class Article:
-    """
-    A class representing a post from the JSONPlaceholder API.
-    """
-
-    articleID: str
-    id: str
-    title: str
-    headers: str
-    body : str
-
-
-
-def schema(configuration: dict):
-  
+def schema(config):
+    """Defines the structure of the data that will be replicated.
+    FIX: Using the list-of-objects format, which is often more reliable
+    for Fivetran SDK validation than the dictionary format."""
     return [
         {
-            "table": "Article",
-            "primary_key": ["id"],
-            "columns": {"articleID": "STRING", "title": "STRING", "headers" : "STRING","body": "STRING"},
+            "table": TABLE_NAME,  # Explicitly defined table name
+            "primary_key": ["url", "publishedAt"], 
+            "columns": {
+                "source_id": "STRING",
+                "source_name": "STRING",
+                "author": "STRING",
+                "title": "STRING",
+                "description": "STRING",
+                "url": "STRING",
+                "urlToImage": "STRING",
+                "publishedAt": "TIMESTAMP",
+                "content": "STRING",
+                # Field to indicate the search term used (the entire query_term string)
+                "search_keyword": "STRING" 
+            }
         }
     ]
-def update(configuration: dict, state: dict):
+
+# ----------------------------------------------------
+# 2. Update (Data Extraction) Logic - Using /v2/everything
+# ----------------------------------------------------
+
+def update(config, state):
     """
-    # Define the update function, which is a required function, and is called by Fivetran during each sync.
-    # See the technical reference documentation for more details on the update function
-    # https://fivetran.com/docs/connectors/connector-sdk/technical-reference#update
-    # The state dictionary is empty for the first sync or for any full re-sync
-    :param configuration: a dictionary that holds the configuration settings for the connector.
-    :param state: a dictionary contains whatever state you have chosen to checkpoint during the prior sync
+    Fetches data using the /v2/everything endpoint, treating the entire query_term 
+    as a single large 'OR' search across a limited number of pages.
+    Implements incremental sync based on the 'publishedAt' cursor.
     """
+    log.warning("Starting News API sync using single broad query.")
     
-    log.info("Fetching articles from JSONPlaceholder")
+    # --- Configuration Retrieval ---
+    api_key = config.get("api_key")
+    if not api_key:
+        raise Exception("News API Key not found in configuration.")
+        
+    query_terms_str = config.get("query_term", "general news") 
+    full_query = query_terms_str
+    
+    # Instantiate the News API Client
+    try:
+        newsapi = NewsApiClient(api_key=api_key) 
+    except NameError:
+        log.error("The 'newsapi' Python package (specifically NewsApiClient) must be installed/available.")
+        raise
 
-    post_list = []
-    for attempt in range(1, __MAX_RETRIES + 1):
+    # ------------------ Incremental Sync Logic ------------------
+    # Determines the date range for the News API call
+    last_sync_time_str = state.get("articles_cursor")
+    
+    if last_sync_time_str:
+        # Use the time from the previous sync state
+        from_date = last_sync_time_str
+        log.info(f"Starting incremental sync from: {from_date}")
+    else:
+        # Initial sync: pull data from the last 30 days (NewsAPI free tier limit)
+        thirty_days_ago = (datetime.utcnow() - timedelta(days=30)).isoformat() + 'Z'
+        from_date = thirty_days_ago
+        log.info(f"Starting initial sync from last 30 days: {from_date}")
+        
+    # The new cursor value is the time this sync is starting
+    new_cursor_value = datetime.utcnow().isoformat() + 'Z' 
+    # ------------------------------------------------------------
+
+    # ------------------ Core Sync Logic (Single Query) ------------------
+    
+    titles_seen_this_run = set()
+    articles_to_upsert = []
+    
+    page = 1
+    total_results_fetched = 0
+    
+    # We loop up to MAX_PAGES_TO_FETCH for the single, broad query
+    while page <= MAX_PAGES_TO_FETCH:
+        log.info(f"Fetching page {page} for full query.")
+
         try:
-            response = requests.get(__API_URL)
-            response.raise_for_status()
-            post_list = response.json()
-            break  # Exit retry loop on success
-        except requests.RequestException as e:
-            log.warning(f"Request attempt {attempt} failed: {e}")
-            if attempt < __MAX_RETRIES:
-                delay = __BASE_DELAY**attempt
-                log.info(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                log.severe("Maximum retry attempts reached. Request aborted.")
-                return
-
-    for post_dict in post_list:
-        try:
-            post = Article(**post_dict)  # Deserialize into a POJO
-
-            # Perform upsert operation, to sync the post data
-            op.upsert(
-                "posts",
-                {"id": post.id, "userId": post.articleID, "title": post.title, "header" : post.header, "body": post.body},
+            # 🎯 REAL NEWS API CALL using the get_everything endpoint
+            results = newsapi.get_everything(
+                q=full_query,
+                from_param=from_date, # ADDED: Use cursor for incremental sync
+                language='en',
+                sort_by='publishedAt',
+                page_size=MAX_ARTICLES_PER_REQUEST,
+                page=page
             )
-
+            
         except Exception as e:
-            log.warning(f"Failed to process post: {post_dict.get('id', 'unknown')} - {e}")
+            # Catch API errors (rate limits, invalid key, etc.) and stop the sync gracefully
+            log.error(f"News API request failed for page {page}: {e}. Stopping sync.")
+            break 
 
-    log.info(f"Synced {len(post_list)} posts")
+        articles = results.get('articles', [])
+        
+        if not articles:
+            log.info(f"No more articles found after page {page}.")
+            break
+        
+        # 3. Process articles for the current page
+        for article in articles:
+            article_title = article.get("title")
+            clean_title = article_title.lower().strip() if article_title else None
+            
+            # Simple Deduplication by Title (within this run)
+            if clean_title and clean_title in titles_seen_this_run:
+                continue
+            if clean_title:
+                titles_seen_this_run.add(clean_title)
+
+            # Flatten and Cleanse Data
+            cleaned_article = {
+                "source_id": article.get('source', {}).get('id'),
+                "source_name": article.get('source', {}).get('name'),
+                "author": article.get('author'),
+                "title": article.get('title'),
+                "description": article.get('description'),
+                "url": article.get('url'),
+                "urlToImage": article.get('urlToImage'),
+                "publishedAt": article.get('publishedAt'),
+                # Ensure content is stringified, as the schema dictates
+                "content": str(article.get('content', '')),
+                "search_keyword": full_query  # Record the full search query used
+            }
+            
+            articles_to_upsert.append(cleaned_article)
+
+        total_results_fetched += len(articles)
+        page += 1
+        
+        # Break if the results returned are less than the page size, indicating the end of results
+        if len(articles) < MAX_ARTICLES_PER_REQUEST:
+            break
+
+
+    log.info(f"Total unique articles processed this run: {len(articles_to_upsert)}")
+
+    # 4. Send data to Fivetran
+    # Upsert prevents duplicates in the warehouse based on the primary key (url, publishedAt)
+    yield op.upsert(table=TABLE_NAME, data=articles_to_upsert)
+    
+    # 5. Checkpoint: Saves a successful state. 
+    yield op.checkpoint(state={"articles_cursor": new_cursor_value}) # UPDATED: Save the new cursor
+    log.info(f"Checkpoint saved: Next sync will search from {new_cursor_value}")
+
+
+# ----------------------------------------------------
+# 3. Initialize the Connector
+# ----------------------------------------------------
+
+connector = Connector(schema=schema, update=update)
+
+
+if __name__ == "__main__":
+    try:
+        # Load configuration from the expected file path
+        with open("config.json", "r") as f:
+            configuration = json.load(f)
+    except FileNotFoundError:
+        log.error("config.json not found. Using empty configuration.")
+        configuration = {}
+    
+    # --- Custom JSON Output Logic for Local Debugging ---
+    try:
+        data_to_output = []
+        
+        # Manually call the update function to capture yielded operations
+        # We start with an empty state ({}) for local testing
+        for operation in update(configuration, {}):
+            # Check if the operation is an Upsert and targets the correct table
+            if isinstance(operation, op.Upsert) and operation.table == TABLE_NAME:
+                data_to_output.extend(operation.data)
+        
+        # Write the captured data to output.json
+        if data_to_output:
+            with open("output.json", "w") as outfile:
+                json.dump(data_to_output, outfile, indent=4)
+            log.warning("Successfully wrote extracted articles to output.json for local inspection.")
+        else:
+            log.warning("No articles were successfully upserted to write to output.json.")
+
+    except Exception as e:
+        log.error(f"Error during local execution and JSON output: {e}")
+    # ----------------------------------------------------
+    
+    # Execute the connector logic in debug mode (This will print operations to stdout)
+    connector.debug(configuration=configuration)
