@@ -1,90 +1,140 @@
+import json 
+from datetime import datetime
+import requests as rq
+
+# Import required classes from fivetran_connector_sdk
 from fivetran_connector_sdk import Connector
-
-# For enabling Logs in your connector code
 from fivetran_connector_sdk import Logging as log
+from fivetran_connector_sdk import Operations as op 
 
-# For supporting Data operations like Upsert(), Update(), Delete() and checkpoint()
-from fivetran_connector_sdk import Operations as op
+# --- Constants ---
+API_BASE_URL = "https://newsdata.io/api/1/latest" 
+TABLE_NAME = "news_articles"
+OUTPUT_DATA_PATH = "articles_output.jsonl" 
 
-# Import requests to make HTTP calls to API.
-import requests
-
-# Import dataclass for creating POJO-style classes
-from dataclasses import dataclass
-
-# Import time for implementing exponential backoff
-import time
-
-
-API_URL = "https://newsdata.io/api/1/archive?apikey="
-API_KEY = "pub_7f9c85763ec94ffca92758b23bc630f3"
-__MAX_RETRIES = 3  # Maximum number of retries for failed requests
-__BASE_DELAY = 2  # Base delay for exponential backoff in seconds
-
-# POJO-style response class
-@dataclass
-class Article:
-    """
-    A class representing a post from the JSONPlaceholder API.
-    """
-
-    articleID: str
-    id: str
-    title: str
-    headers: str
-    body : str
-
-
-
+# --- Schema Definition (Unchanged) ---
 def schema(configuration: dict):
-  
     return [
         {
-            "table": "Article",
-            "primary_key": ["id"],
-            "columns": {"articleID": "STRING", "title": "STRING", "headers" : "STRING","body": "STRING"},
+            "table": TABLE_NAME,
+            "primary_key": ["article_id"] 
         }
     ]
-def update(configuration: dict, state: dict):
+
+def validate_configuration(configuration: dict):
+    if "api_key" not in configuration:
+        raise ValueError("Missing required configuration value: 'api_key'")
+
+
+# --- Main Sync Logic (FINAL FIX: Append and Deduplicate by Title) ---
+def update(configuration: dict, state: dict): 
     """
-    # Define the update function, which is a required function, and is called by Fivetran during each sync.
-    # See the technical reference documentation for more details on the update function
-    # https://fivetran.com/docs/connectors/connector-sdk/technical-reference#update
-    # The state dictionary is empty for the first sync or for any full re-sync
-    :param configuration: a dictionary that holds the configuration settings for the connector.
-    :param state: a dictionary contains whatever state you have chosen to checkpoint during the prior sync
+    Performs a full sync, prevents duplicate articles based on title during the run,
+    and appends data to the output file and database (via UPSERT).
     """
+    log.warning("Starting News API sync: Appending data, deduplicating by title.")
     
-    log.info("Fetching articles from JSONPlaceholder")
+    validate_configuration(configuration=configuration)
 
-    post_list = []
-    for attempt in range(1, __MAX_RETRIES + 1):
-        try:
-            response = requests.get(__API_URL)
-            response.raise_for_status()
-            post_list = response.json()
-            break  # Exit retry loop on success
-        except requests.RequestException as e:
-            log.warning(f"Request attempt {attempt} failed: {e}")
-            if attempt < __MAX_RETRIES:
-                delay = __BASE_DELAY**attempt
-                log.info(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                log.severe("Maximum retry attempts reached. Request aborted.")
-                return
+    api_key = configuration.get("api_key")
+    query_terms_str = configuration.get("query_term", "fivetran") 
+    api_endpoint = configuration.get("api_endpoint", API_BASE_URL)
 
-    for post_dict in post_list:
-        try:
-            post = Article(**post_dict)  # Deserialize into a POJO
+    keywords = [term.strip() for term in query_terms_str.split(',') if term.strip()]
+    
+    # Use a dictionary for deduplication based on article_id across multiple queries
+    all_unique_articles = {} 
+    
+    # 🎯 NEW: Use a set to track titles encountered during this run for title-based deduplication
+    titles_seen_this_run = set()
 
-            # Perform upsert operation, to sync the post data
-            op.upsert(
-                "posts",
-                {"id": post.id, "userId": post.articleID, "title": post.title, "header" : post.header, "body": post.body},
-            )
+    # We must open the file in APPEND mode ('a') before the loop starts
+    try:
+        # Use 'a' for append mode to keep existing data
+        with open(OUTPUT_DATA_PATH, 'a', encoding='utf-8') as f:
+            
+            for keyword in keywords:
+                log.info(f"Fetching data for query: '{keyword}'")
 
-        except Exception as e:
-            log.warning(f"Failed to process post: {post_dict.get('id', 'unknown')} - {e}")
+                params = {
+                    "apikey": api_key,
+                    "q": keyword, 
+                    "language": "en" 
+                }
+                
+                # --- API Request ---
+                try:
+                    response = rq.get(api_endpoint, params=params)
+                    response.raise_for_status() 
+                    articles = response.json().get("results", [])
+                    log.info(f"Retrieved {len(articles)} articles for '{keyword}'.")
 
-    log.info(f"Synced {len(post_list)} posts")
+                    # --- Deduplication and Writing ---
+                    for article in articles:
+                        article_id = article.get("article_id")
+                        article_title = article.get("title")
+                        
+                        # Use lowercase, stripped title for robust comparison
+                        clean_title = article_title.lower().strip() if article_title else None
+
+                        # Check if article_id or clean_title is already processed in this run
+                        if article_id in all_unique_articles:
+                            continue
+                        if clean_title and clean_title in titles_seen_this_run:
+                            log.fine(f"Skipping article with duplicate title: {article_title[:40]}...")
+                            continue
+
+                        # Mark as seen
+                        all_unique_articles[article_id] = article
+                        if clean_title:
+                            titles_seen_this_run.add(clean_title)
+                            
+                        # Data Cleansing 
+                        cleaned_article = {}
+                        for key, value in article.items():
+                            if isinstance(value, list):
+                                cleaned_article[key] = ",".join(map(str, value))
+                            elif isinstance(value, dict):
+                                cleaned_article[key] = json.dumps(value)
+                            else:
+                                cleaned_article[key] = value
+
+                        # 🎯 1. Append to Database (via SDK/Tester's op.upsert)
+                        op.upsert(table=TABLE_NAME, data=cleaned_article) 
+
+                        # 🎯 2. Append to Manual Output File
+                        fif_record = {
+                            "data": cleaned_article,
+                            "table": TABLE_NAME,
+                            "operation": "UPSERT" 
+                        }
+                        f.write(json.dumps(fif_record) + '\n')
+                            
+                except rq.exceptions.RequestException as e:
+                    log.error(f"API request failed for keyword '{keyword}': {e}. Continuing.")
+                
+            log.info(f"Total unique articles processed and appended: {len(all_unique_articles)}")
+
+    except Exception as e:
+        log.severe(f"Fatal error during file write or sync: {e}")
+        raise 
+
+    # 5. Checkpoint the new state
+    op.checkpoint(state=state) 
+    
+    log.info("Successfully finished sync. Data appended to database and output file.")
+
+
+# This creates the connector object that will use the update and schema functions defined.
+connector = Connector(update=update, schema=schema)
+
+# Check if the script is being run as the main module.
+if __name__ == "__main__":
+    try:
+        with open("configuration.json", "r") as f:
+            configuration = json.load(f)
+    except FileNotFoundError:
+        log.error("configuration.json not found. Using empty configuration.")
+        configuration = {}
+        
+    connector.debug(configuration=configuration)
